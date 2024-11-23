@@ -1,0 +1,103 @@
+% Load skin dataset
+imds = imageDatastore('C:\user\sar\Dataset', 'LabelSource', 'foldernames', 'FileExtensions', '.jpg');
+imds.ReadFcn = @(filename) imresize(imread(filename), [224 224 3]); % image input size (224x224x3)
+% Define class names 
+classNames = {'Cls1', 'Cls2', 'Cls3'};
+labelIDs = [1, 2, 3];  
+% Split data into training and validation sets
+[imdsTrain, imdsValidation] = splitEachLabel(imds, 0.7, 'randomized');
+%Modify ResNet-50 for 3-Class Classification
+% Load the pre-trained ResNet-50 model
+net = resnet50;
+% Replace the last fully connected layer to fit 3 classes
+numClasses = 3;
+lgraph = layerGraph(net);
+% Replace the final fully connected layer and the classification layer
+newFcLayer = fullyConnectedLayer(numClasses, 'Name', 'new_fc', 'WeightLearnRateFactor',10, 'BiasLearnRateFactor',10);
+lgraph = replaceLayer(lgraph, 'fc1000', newFcLayer);
+newClassLayer = classificationLayer('Name', 'new_classification_layer');
+lgraph = replaceLayer(lgraph, 'ClassificationLayer_fc1000', newClassLayer);
+% Check the modified architecture
+plot(lgraph);
+% Define training options
+options = trainingOptions('adam', ...
+    'MaxEpochs', 30, ...
+    'InitialLearnRate', 1e-4, ...
+    'MiniBatchSize', 32, ...
+    'ValidationData', imdsValidation, ...
+    'ValidationFrequency', 10, ...
+    'Verbose', true, ...
+    'Plots', 'training-progress');
+
+% Train the model
+trainedNet = trainNetwork(imdsTrain, lgraph, options);
+% Define the function to calculate Grad-CAM
+function [heatmap, output] = gradCAM(model, image, classIndex)
+    % Get the last convolutional layer of ResNet-50
+    lastConvLayer = 'activation_49_relu';  
+    
+    % Forward pass to get the model's output
+    [features, scores] = activations(model, image, lastConvLayer, 'OutputAs', 'channels');
+    
+    % Get the gradient of the class score with respect to the output feature map
+    score = scores(:, classIndex);
+    grad = gradCAMGradients(model, image, score, lastConvLayer);
+    
+    % Compute the weighted sum of gradients and feature map
+    weights = squeeze(mean(grad, [1, 2])); % Global average pooling of gradients
+    weightedSum = sum(bsxfun(@times, features, reshape(weights, 1, 1, [])), 3);
+    
+    % Apply ReLU to the weighted sum (only positive importance)
+    heatmap = max(weightedSum, 0);
+    
+    % Normalize heatmap to [0, 1]
+    heatmap = (heatmap - min(heatmap(:))) / (max(heatmap(:)) - min(heatmap(:)));
+    
+    % Resize heatmap to the original image size
+    heatmap = imresize(heatmap, [224, 224]);
+    
+    % Overlay heatmap on original image
+    output = image;
+    output = output(:,:,:) * 0.6 + repmat(heatmap, [1, 1, 3]) * 0.4; % Overlay with transparency
+end
+
+%  helper function compute gradients for Grad-CAM
+function grad = gradCAMGradients(model, image, classScore, lastConvLayer)
+    % Use a custom layer for backpropagation
+    customLayer = customBackpropLayer(classScore, lastConvLayer);
+    
+    % Perform backpropagation and get the gradients
+    grad = dlarray(zeros(size(image)), 'SSCB'); % Initialize gradients
+    grad = dlarray(grad, 'SSCB');
+    dlgradients = dlgradient(customLayer, image);
+    grad = squeeze(dlgradients); % Extract gradient
+end
+
+% Helper function to perform backpropagation through the custom layer
+function customLayer = customBackpropLayer(classScore, lastConvLayer)
+    % Custom backpropagation layer code (specific to ResNet-50)
+    % This layer will allow us to calculate the gradients
+    customLayer = classScore - lastConvLayer;
+end
+% Load an image for Grad-CAM visualization 
+imgPath = imdsValidation.Files{1};
+img = imread(imgPath);
+
+% Preprocess the image
+imgResized = imresize(img, [224 224]);
+
+% Classify the image to get the predicted class index
+[~, predictedClassIdx] = max(predict(trainedNet, imgResized));
+
+% Calculate Grad-CAM
+[heatmap, output] = gradCAM(trainedNet, imgResized, predictedClassIdx);
+
+% Display the original image and Grad-CAM result
+figure;
+subplot(1, 2, 1);
+imshow(img);
+title('Original Image');
+subplot(1, 2, 2);
+imshow(output);
+title(['Grad-CAM Result (Class: ', classNames{predictedClassIdx}, ')']);
+
